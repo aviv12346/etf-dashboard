@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>US Industry & Thematic ETFs Dashboard - Distance from ATH</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
+    body { font-family: 'Inter', sans-serif; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useMemo, useEffect, useCallback } = React;
+    const AUTO_REFRESH_MS = 5 * 60 * 1000;
+
+    // ---------- constants & helpers ----------
+    const QUAD = {
+      Leading:   { label: "Leading",   cls: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20", hex: "#34d399", order: 0 },
+      Improving: { label: "Improving", cls: "bg-blue-500/10 text-blue-400 border-blue-500/20",         hex: "#60a5fa", order: 1 },
+      Weakening: { label: "Weakening",  cls: "bg-amber-500/10 text-amber-400 border-amber-500/20",      hex: "#fbbf24", order: 2 },
+      Lagging:   { label: "Lagging",    cls: "bg-rose-500/10 text-rose-400 border-rose-500/20",         hex: "#fb7185", order: 3 },
+      NA:        { label: "—",                 cls: "bg-slate-800 text-slate-500 border-slate-700",            hex: "#64748b", order: 4 },
+    };
+    const CAT_LABEL = { ALL: "All", FAVS: "⭐ Favorites" };
+    const HEAT_METRICS = [
+      ["dayChg", "Daily", 3], ["r1m", "1 Month", 10], ["r3m", "3 Months", 20], ["r6m", "6 Months", 30],
+      ["r12m", "1 Year", 50], ["rel3m", "3M RS", 15], ["distAth", "Distance from ATH", 40], ["dist52", "Dist. from Prev High", 30],
+    ];
+
+    const store = {
+      get: (k, d) => { try { const v = JSON.parse(localStorage.getItem(k)); return v == null ? d : v; } catch { return d; } },
+      set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+    };
+    const readHash = () => { try { return JSON.parse(decodeURIComponent(location.hash.slice(1))) || {}; } catch { return {}; } };
+
+    const fmtPct = (v, d = 2) => v == null ? "—" : (v > 0 ? "+" : "") + v.toFixed(d) + "%";
+    const pctCls = v => v == null ? "text-slate-500" : v >= 0 ? "text-emerald-400" : "text-rose-400";
+    const rankCls = r => r == null ? "bg-slate-800 text-slate-500" : r >= 80 ? "bg-emerald-500/20 text-emerald-300"
+      : r >= 50 ? "bg-indigo-500/20 text-indigo-300" : r >= 25 ? "bg-amber-500/20 text-amber-300" : "bg-rose-500/20 text-rose-300";
+    const barCls = d => d >= -5 ? "bg-emerald-500 shadow-sm shadow-emerald-500" : d >= -15 ? "bg-indigo-500" : d >= -30 ? "bg-amber-500" : "bg-rose-500";
+
+    const withTrend = r => ({ ...r, trendScore: ["sma20", "sma50", "sma200"].filter(k => r[k] != null && r.price > r[k]).length });
+
+    function sortRows(rows, { key, dir }) {
+      const m = dir === "asc" ? 1 : -1;
+      const val = r => key === "quadrant" ? (QUAD[r.quadrant] || QUAD.NA).order : r[key];
+      return [...rows].sort((a, b) => {
+        const x = val(a), y = val(b);
+        if (x == null && y == null) return 0;
+        if (x == null) return 1;
+        if (y == null) return -1;
+        return typeof x === "string" ? m * x.localeCompare(y) : m * (x - y);
+      });
+    }
+
+    function downloadCsv(filename, columns, rows) {
+      const esc = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+      const lines = [columns.map(c => esc(c[0])).join(",")].concat(rows.map(r => columns.map(c => esc(c[1](r))).join(",")));
+      const blob = new Blob(["\ufeff" + lines.join("\n")], { type: "text/csv;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+      URL.revokeObjectURL(a.href);
+    }
+    const ETF_CSV = [
+      ["Ticker", r => r.ticker], ["Name", r => r.name], ["Category", r => r.category], ["Price", r => r.price],
+      ["Day %", r => r.dayChg], ["ATH", r => r.ath], ["ATH date", r => r.athDate], ["Dist ATH %", r => r.distAth],
+      ["Dist ATH adj %", r => r.distAthAdj], ["Prev high (52w)", r => r.high52], ["Dist prev high %", r => r.dist52],
+      ["Prev high date", r => r.high52Date], ["Prior swing high", r => r.priorHigh], ["Dist prior swing %", r => r.distPriorHigh],
+      ["RS rank", r => r.rsRank], ["RS 1m", r => r.rel1m], ["RS 3m", r => r.rel3m], ["RS 6m", r => r.rel6m], ["RS 12m", r => r.rel12m],
+      ["Ret 1m", r => r.r1m], ["Ret 3m", r => r.r3m], ["Ret 6m", r => r.r6m], ["Ret 12m", r => r.r12m],
+      ["SMA20", r => r.sma20], ["SMA50", r => r.sma50], ["SMA200", r => r.sma200], ["Cross", r => r.cross],
+      ["RSI14", r => r.rsi], ["ATR %", r => r.atrPct], ["Vol ratio", r => r.volRatio],
+      ["RS-Ratio", r => r.rsRatio], ["RS-Momentum", r => r.rsMom], ["Quadrant", r => r.quadrant],
+    ];
+
+    // ---------- small visual components ----------
+    function Spark({ values }) {
+      if (!values || values.length < 2) return null;
+      const W = 90, H = 28, min = Math.min(...values), max = Math.max(...values);
+      const pts = values.map((v, i) => `${(i / (values.length - 1) * W).toFixed(1)},${(H - 2 - (v - min) / (max - min || 1) * (H - 4)).toFixed(1)}`).join(" ");
+      const up = values[values.length - 1] >= values[0];
+      return (
+        <svg width={W} height={H} style={{ direction: "ltr" }}>
+          <polyline points={pts} fill="none" stroke={up ? "#34d399" : "#fb7185"} strokeWidth="1.6" strokeLinejoin="round" />
+        </svg>
+      );
+    }
+
+    function DetailChart({ hist, high52 }) {
+      const [hover, setHover] = useState(null);
+      const W = 800, H = 260, P = { l: 8, r: 8, t: 10, b: 10 };
+      const n = hist.c.length;
+      const all = [...hist.c, ...hist.s50.filter(v => v != null), ...hist.s200.filter(v => v != null)];
+      const min = Math.min(...all), max = Math.max(...all);
+      const x = i => P.l + (i / (n - 1)) * (W - P.l - P.r);
+      const y = v => P.t + (1 - (v - min) / (max - min || 1)) * (H - P.t - P.b);
+      const path = arr => { let d = ""; arr.forEach((v, i) => { if (v == null) return; d += (d === "" || arr[i - 1] == null ? "M" : "L") + x(i).toFixed(1) + " " + y(v).toFixed(1) + " "; }); return d; };
+      const onMove = e => {
+        const r = e.currentTarget.getBoundingClientRect();
+        const i = Math.round(((e.clientX - r.left) / r.width * W - P.l) / (W - P.l - P.r) * (n - 1));
+        setHover(Math.max(0, Math.min(n - 1, i)));
+      };
+      return (
+        <div dir="ltr" className="relative">
+          <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-64" onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
+            {[0.25, 0.5, 0.75].map(t => <line key={t} x1={P.l} x2={W - P.r} y1={P.t + t * (H - P.t - P.b)} y2={P.t + t * (H - P.t - P.b)} stroke="#1e293b" />)}
+            {high52 >= min && high52 <= max && <line x1={P.l} x2={W - P.r} y1={y(high52)} y2={y(high52)} stroke="#10b981" strokeDasharray="4 4" opacity="0.6" />}
+            <path d={path(hist.s200)} fill="none" stroke="#fb7185" strokeWidth="1.3" />
+            <path d={path(hist.s50)} fill="none" stroke="#fbbf24" strokeWidth="1.3" />
+            <path d={path(hist.c)} fill="none" stroke="#e2e8f0" strokeWidth="1.8" strokeLinejoin="round" />
+            {hover != null && <>
+              <line x1={x(hover)} x2={x(hover)} y1={P.t} y2={H - P.b} stroke="#64748b" />
+              <circle cx={x(hover)} cy={y(hist.c[hover])} r="3.5" fill="#818cf8" />
+            </>}
+          </svg>
+          <div className="flex justify-between text-[10px] text-slate-500 font-mono px-1">
+            <span>{hist.d[0]}</span>
+            <span className="text-slate-300">{hover != null ? `${hist.d[hover]}  $${hist.c[hover]}` : "Hover over the chart"}</span>
+            <span>{hist.d[n - 1]}</span>
+          </div>
+          <div className="flex gap-4 text-[10px] text-slate-400 mt-1 justify-center">
+            <span><i className="inline-block w-3 h-0.5 bg-slate-200 align-middle"></i> Price</span>
+            <span><i className="inline-block w-3 h-0.5 bg-amber-400 align-middle"></i> SMA50</span>
+            <span><i className="inline-block w-3 h-0.5 bg-rose-400 align-middle"></i> SMA200</span>
+            <span><i className="inline-block w-3 h-0.5 bg-emerald-500 align-middle"></i> 52-week high</span>
+          </div>
+        </div>
+      );
+    }
+
+    function Stat({ label, children }) {
+      return <div className="bg-slate-950/60 border border-slate-800 rounded-lg px-3 py-2"><div className="text-[10px] text-slate-500">{label}</div><div className="font-mono text-sm" dir="ltr">{children}</div></div>;
+    }
+
+    function DetailPanel({ r }) {
+      return (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 p-4">
+          <div className="lg:col-span-2">{r.hist ? <DetailChart hist={r.hist} high52={r.high52} /> : null}</div>
+          <div className="grid grid-cols-2 gap-2 content-start">
+            {["1m", "3m", "6m", "12m"].map(k => (
+              <Stat key={k} label={`Return ${k} | RS`}>
+                <span className={pctCls(r[`r${k}`])}>{fmtPct(r[`r${k}`], 1)}</span>
+                <span className="text-slate-600"> | </span>
+                <span className={pctCls(r[`rel${k}`])}>{fmtPct(r[`rel${k}`], 1)}</span>
+              </Stat>
+            ))}
+            <Stat label="Adjusted ATH (dividends/splits)"><span className={pctCls(r.distAthAdj)}>{fmtPct(r.distAthAdj, 1)}</span></Stat>
+            <Stat label="52-week high (Prev high)">${r.high52} <span className={pctCls(r.dist52)}>({fmtPct(r.dist52, 1)})</span></Stat>
+            <Stat label="Prior swing high">${r.priorHigh} <span className={pctCls(r.distPriorHigh)}>({fmtPct(r.distPriorHigh, 1)})</span></Stat>
+            <Stat label="SMA 20 / 50 / 200">{r.sma20 ?? "—"} / {r.sma50 ?? "—"} / {r.sma200 ?? "—"}</Stat>
+            <Stat label="RS-Ratio / RS-Momentum">{r.rsRatio ?? "—"} / {r.rsMom ?? "—"}</Stat>
+            <Stat label="RSI(14)">{r.rsi}</Stat>
+            <Stat label="ATR(14) | Rel. volume">{r.atrPct}% | ×{r.volRatio ?? "—"}</Stat>
+          </div>
+        </div>
+      );
+    }
+
+    // ---------- views ----------
+    function Th({ k, label, sort, onSort, className = "" }) {
+      const active = sort.key === k;
+      return (
+        <th className={`py-3 px-3 select-none ${className}`}>
+          <button onClick={() => onSort(k)} className={`flex items-center gap-1 uppercase tracking-wider hover:text-white transition-colors ${active ? "text-indigo-300" : ""} ${className.includes("text-center") ? "mx-auto" : ""}`}>
+            {label}<span className="text-[9px]">{active ? (sort.dir === "asc" ? "▲" : "▼") : "↕"}</span>
+          </button>
+        </th>
+      );
+    }
+
+    function TrendCell({ r }) {
+      return (
+        <div className="flex flex-col items-center gap-1">
+          <div className="flex gap-1">
+            {[["20", r.sma20], ["50", r.sma50], ["200", r.sma200]].map(([l, v]) => (
+              <span key={l} title={`SMA${l}: ${v ?? "n/a"}`}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${v == null ? "bg-slate-800 text-slate-600" : r.price > v ? "text-emerald-400 bg-emerald-950/40" : "text-rose-400 bg-rose-950/40"}`}>{l}</span>
+            ))}
+          </div>
+          {r.cross === "golden" && <span className="text-[10px] px-1.5 rounded bg-yellow-500/20 text-yellow-300" title="SMA50 crossed above SMA200 within the last 30 days">✦ Golden Cross</span>}
+          {r.cross === "death" && <span className="text-[10px] px-1.5 rounded bg-rose-500/20 text-rose-300" title="SMA50 crossed below SMA200 within the last 30 days">☠ Death Cross</span>}
+        </div>
+      );
+    }
+
+    function TableView({ rows, sort, onSort, expanded, setExpanded, favs, toggleFav, extra, removeExtra }) {
+      return (
+        <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-xl">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-slate-950/70 border-b border-slate-800 text-slate-400 text-xs font-semibold">
+                <tr>
+                  <th className="py-3 px-2 w-8"></th>
+                  <Th k="ticker" label="ETF / Ticker" sort={sort} onSort={onSort} />
+                  <Th k="price" label="Price | Day" sort={sort} onSort={onSort} />
+                  <th className="py-3 px-3">ATH</th>
+                  <Th k="distAth" label="Distance from ATH" sort={sort} onSort={onSort} className="w-44" />
+                  <Th k="dist52" label="Distance from Prev High" sort={sort} onSort={onSort} className="w-48" />
+                  <Th k="rsRank" label="RS Rank" sort={sort} onSort={onSort} className="text-center" />
+                  <Th k="trendScore" label="Trend (SMA)" sort={sort} onSort={onSort} className="text-center" />
+                  <Th k="rsi" label="RSI | Vol | ATR" sort={sort} onSort={onSort} className="text-center" />
+                  <th className="py-3 px-3 text-center">60 Days</th>
+                  <Th k="quadrant" label="Cycle phase" sort={sort} onSort={onSort} className="text-center" />
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/60">
+                {rows.map(r => {
+                  const q = QUAD[r.quadrant] || QUAD.NA, open = expanded === r.ticker, isFav = favs.includes(r.ticker);
+                  return (
+                    <React.Fragment key={r.ticker}>
+                      <tr onClick={() => setExpanded(open ? null : r.ticker)} className={`cursor-pointer hover:bg-slate-800/40 transition-colors ${open ? "bg-slate-800/30" : ""}`}>
+                        <td className="py-3 px-2 text-center" onClick={e => { e.stopPropagation(); toggleFav(r.ticker); }}>
+                          <span className={`text-lg leading-none ${isFav ? "text-yellow-400" : "text-slate-700 hover:text-slate-400"}`}>★</span>
+                        </td>
+                        <td className="py-3 px-3">
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-white text-base tracking-wide">{r.ticker}</span>
+                            {extra.includes(r.ticker) && <button onClick={e => { e.stopPropagation(); removeExtra(r.ticker); }} className="text-slate-600 hover:text-rose-400 text-xs" title="Remove from list">✕</button>}
+                          </div>
+                          <div className="text-xs text-slate-400 truncate max-w-[170px]">{r.name}</div>
+                          <span className="text-[10px] text-slate-500 uppercase">{r.category}</span>
+                        </td>
+                        <td className="py-3 px-3 font-mono" dir="ltr">
+                          <div className="text-slate-200 font-medium">${r.price.toFixed(2)}</div>
+                          <div className={`text-xs ${pctCls(r.dayChg)}`}>{fmtPct(r.dayChg)}</div>
+                        </td>
+                        <td className="py-3 px-3 font-mono text-slate-400" dir="ltr">
+                          <div>${r.ath.toFixed(2)}</div><div className="text-[10px] text-slate-600">{r.athDate}</div>
+                        </td>
+                        <td className="py-3 px-3">
+                          <div className="flex justify-between items-center text-xs font-mono" dir="ltr">
+                            <span className="text-slate-200">{r.distAth}%</span>
+                            {r.distAth >= -5 && <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-1 rounded">Near ATH</span>}
+                          </div>
+                          <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden my-1">
+                            <div className={`h-full rounded-full transition-all duration-500 ${barCls(r.distAth)}`} style={{ width: `${Math.max(5, 100 + r.distAth)}%` }}></div>
+                          </div>
+                          <div className="text-[10px] text-slate-500 font-mono" dir="ltr" title="Adjusted for dividends & splits">adj {r.distAthAdj}%</div>
+                        </td>
+                        <td className="py-3 px-3">
+                          <div className="flex justify-between items-center text-xs font-mono" dir="ltr">
+                            <span className="text-slate-200">{r.dist52}%</span>
+                            {r.dist52 >= -5 && <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-1 rounded">Near high</span>}
+                          </div>
+                          <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden my-1">
+                            <div className={`h-full rounded-full transition-all duration-500 ${barCls(r.dist52)}`} style={{ width: `${Math.max(5, 100 + r.dist52)}%` }}></div>
+                          </div>
+                          <div className="text-[10px] text-slate-400 font-mono flex justify-between" dir="ltr" title={`52-Week High: $${r.high52} on ${r.high52Date || ''}\nPrior Swing High: $${r.priorHigh || ''} (${r.distPriorHigh != null ? r.distPriorHigh + '%' : ''})`}>
+                            <span>${r.high52}</span>
+                            <span className="text-slate-500">{r.high52Date}</span>
+                          </div>
+                        </td>
+                        <td className="py-3 px-3 text-center">
+                          <span className={`inline-block min-w-[2.2rem] px-2 py-0.5 rounded font-mono font-bold text-sm ${rankCls(r.rsRank)}`}
+                            title={`RS vs SPY — 1m: ${fmtPct(r.rel1m, 1)} · 3m: ${fmtPct(r.rel3m, 1)} · 6m: ${fmtPct(r.rel6m, 1)} · 12m: ${fmtPct(r.rel12m, 1)}`}>{r.rsRank ?? "—"}</span>
+                          <div className={`text-[11px] font-mono mt-0.5 ${pctCls(r.rel3m)}`} dir="ltr">{fmtPct(r.rel3m, 1)} (3m)</div>
+                        </td>
+                        <td className="py-3 px-3"><TrendCell r={r} /></td>
+                        <td className="py-3 px-3 text-center font-mono text-xs" dir="ltr">
+                          <div className={r.rsi >= 70 ? "text-amber-300" : r.rsi <= 30 ? "text-sky-300" : "text-slate-200"}>RSI {r.rsi}</div>
+                          <div className={`${r.volRatio >= 1.5 ? "text-yellow-300" : "text-slate-500"}`}>Vol ×{r.volRatio ?? "—"}</div>
+                          <div className="text-slate-500">ATR {r.atrPct}%</div>
+                        </td>
+                        <td className="py-3 px-3"><div className="flex justify-center"><Spark values={r.hist ? r.hist.c.slice(-60) : r.spark} /></div></td>
+                        <td className="py-3 px-3 text-center">
+                          <span className={`inline-block border px-2.5 py-1 rounded-md text-xs font-medium ${q.cls}`}>{q.label}</span>
+                        </td>
+                      </tr>
+                      {open && <tr className="bg-slate-950/40"><td colSpan={11}><DetailPanel r={r} /></td></tr>}
+                    </React.Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {rows.length === 0 && <div className="p-10 text-center text-slate-500 text-sm">No results</div>}
+        </div>
+      );
+    }
+
+    function tileColor(metric, v) {
+      if (v == null) return "#1e293b";
+      const scale = HEAT_METRICS.find(m => m[0] === metric)[2];
+      if (metric === "distAth") { const t = Math.min(1, Math.max(0, 1 + v / scale)); return `hsl(${(t * 140).toFixed(0)},55%,26%)`; }
+      const t = Math.max(-1, Math.min(1, v / scale));
+      return t >= 0 ? `hsl(145,55%,${20 + t * 16}%)` : `hsl(350,60%,${20 - t * 16}%)`;
+    }
+
+    function Heatmap({ rows, metric, setMetric }) {
+      const groups = useMemo(() => {
+        const g = {};
+        rows.forEach(r => (g[r.category] = g[r.category] || []).push(r));
+        return Object.entries(g);
+      }, [rows]);
+      return (
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <div className="flex flex-wrap gap-1.5 mb-4 items-center">
+            <span className="text-xs text-slate-400 ml-2">Color by:</span>
+            {HEAT_METRICS.map(([k, l]) => (
+              <button key={k} onClick={() => setMetric(k)} className={`px-3 py-1 text-xs rounded-lg transition-all ${metric === k ? "bg-indigo-600 text-white font-semibold" : "bg-slate-800/80 text-slate-400 hover:text-white"}`}>{l}</button>
+            ))}
+          </div>
+          {groups.map(([cat, items]) => (
+            <div key={cat} className="mb-4">
+              <div className="text-[11px] text-slate-500 uppercase mb-1.5">{cat}</div>
+              <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-1.5">
+                {items.map(r => (
+                  <div key={r.ticker} style={{ background: tileColor(metric, r[metric]) }} className="rounded-lg p-2.5 text-center transition-transform hover:scale-[1.04] cursor-default"
+                    title={`${r.name}\nRS Rank ${r.rsRank} | ATH ${r.distAth}%`}>
+                    <div className="font-bold text-white">{r.ticker}</div>
+                    <div className="font-mono text-sm text-white/90" dir="ltr">{fmtPct(r[metric], 1)}</div>
+                    <div className="text-[10px] text-white/50 truncate">{r.name}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    function RRG({ rows }) {
+      const pts = rows.filter(r => r.rsRatio != null && r.rsMom != null);
+      const W = 760, H = 520, P = 36;
+      const D = Math.max(3, ...pts.flatMap(r => [Math.abs(r.rsRatio - 100), Math.abs(r.rsMom - 100)])) * 1.15;
+      const x = v => P + ((v - (100 - D)) / (2 * D)) * (W - 2 * P);
+      const y = v => H - P - ((v - (100 - D)) / (2 * D)) * (H - 2 * P);
+      const cx = x(100), cy = y(100);
+      return (
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <div className="text-xs text-slate-400 mb-3">
+            Relative Rotation Graph — X axis: RS-Ratio (relative strength vs SPY), Y axis: RS-Momentum (10-day change). ETFs usually rotate clockwise: Improving ← Leading ← Weakening ← Lagging.
+          </div>
+          <div dir="ltr">
+            <svg viewBox={`0 0 ${W} ${H}`} className="w-full max-w-4xl mx-auto">
+              <rect x={cx} y={P} width={W - P - cx} height={cy - P} fill="#064e3b" opacity="0.35" />
+              <rect x={cx} y={cy} width={W - P - cx} height={H - P - cy} fill="#78350f" opacity="0.30" />
+              <rect x={P} y={cy} width={cx - P} height={H - P - cy} fill="#7f1d1d" opacity="0.30" />
+              <rect x={P} y={P} width={cx - P} height={cy - P} fill="#1e3a8a" opacity="0.35" />
+              <line x1={cx} x2={cx} y1={P} y2={H - P} stroke="#475569" />
+              <line x1={P} x2={W - P} y1={cy} y2={cy} stroke="#475569" />
+              <text x={W - P - 6} y={P + 16} textAnchor="end" fill="#34d399" fontSize="13" fontWeight="700">Leading</text>
+              <text x={W - P - 6} y={H - P - 8} textAnchor="end" fill="#fbbf24" fontSize="13" fontWeight="700">Weakening</text>
+              <text x={P + 6} y={H - P - 8} fill="#fb7185" fontSize="13" fontWeight="700">Lagging</text>
+              <text x={P + 6} y={P + 16} fill="#60a5fa" fontSize="13" fontWeight="700">Improving</text>
+              {pts.map(r => {
+                const c = (QUAD[r.quadrant] || QUAD.NA).hex;
+                return (
+                  <g key={r.ticker}>
+                    <circle cx={x(r.rsRatio)} cy={y(r.rsMom)} r="5" fill={c} stroke="#0f172a" strokeWidth="1.5" />
+                    <text x={x(r.rsRatio) + 8} y={y(r.rsMom) + 4} fill="#e2e8f0" fontSize="11">{r.ticker}</text>
+                    <title>{`${r.ticker} — ${r.name}\nRS-Ratio ${r.rsRatio} | Momentum ${r.rsMom}`}</title>
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
+        </div>
+      );
+    }
+
+    function Scanner({ scan, loading, error, onReload, favs }) {
+      const [leadersOnly, setLeadersOnly] = useState(true);
+      const [sort, setSort] = useState({ key: "rsRank", dir: "desc" });
+      const onSort = k => setSort(s => s.key === k ? { key: k, dir: s.dir === "asc" ? "desc" : "asc" } : { key: k, dir: k === "ticker" ? "asc" : "desc" });
+      const rows = useMemo(() => {
+        if (!scan) return [];
+        const all = scan.stocks.map(withTrend).map(r => ({ ...r, leader: r.dist52 >= -5 && (r.rsRank || 0) >= 70 && r.sma200 != null && r.price > r.sma50 && r.price > r.sma200 }));
+        return sortRows(leadersOnly ? all.filter(r => r.leader) : all, sort);
+      }, [scan, leadersOnly, sort]);
+
+      if (!scan) {
+        return (
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-12 text-center text-slate-400">
+            {error ? <><div className="text-rose-400 mb-3">Error: {error}</div><button onClick={onReload} className="px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm">Try again</button></>
+              : <><div className="w-8 h-8 mx-auto mb-3 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+                  <div>Scanning stocks from the strongest ETFs... (may take up to a minute the first time)</div></>}
+          </div>
+        );
+      }
+      return (
+        <div>
+          <div className="flex flex-wrap items-center gap-3 mb-3 text-xs text-slate-400">
+            <span>Source ETFs ({scan.sourceEtfs.length}): <strong className="text-slate-200" dir="ltr">{scan.sourceEtfs.join(", ")}</strong></span>
+            <label className="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" checked={leadersOnly} onChange={e => setLeadersOnly(e.target.checked)} /> Leaders only (within 5% of 52w high, RS≥70, above SMA50 & SMA200)</label>
+            <button onClick={() => downloadCsv("scanner.csv", [...ETF_CSV.filter(c => !["Category", "Name"].includes(c[0])), ["Sources", r => (r.sources || []).join(" ")]], rows)} className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">⬇ CSV</button>
+            <button onClick={onReload} disabled={loading} className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-50">{loading ? "Scanning..." : "⟳ Rescan"}</button>
+            <span>{rows.length} stocks</span>
+          </div>
+          <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-slate-950/70 border-b border-slate-800 text-slate-400 text-xs font-semibold">
+                  <tr>
+                    <Th k="ticker" label="Stock" sort={sort} onSort={onSort} />
+                    <th className="py-3 px-3">Source (ETF)</th>
+                    <Th k="price" label="Price" sort={sort} onSort={onSort} />
+                    <Th k="dayChg" label="Daily" sort={sort} onSort={onSort} />
+                    <Th k="distAth" label="From ATH" sort={sort} onSort={onSort} />
+                    <Th k="dist52" label="From 52w high" sort={sort} onSort={onSort} />
+                    <Th k="rsRank" label="RS Rank" sort={sort} onSort={onSort} className="text-center" />
+                    <Th k="rel3m" label="RS 3m" sort={sort} onSort={onSort} />
+                    <Th k="trendScore" label="SMA" sort={sort} onSort={onSort} className="text-center" />
+                    <Th k="volRatio" label="Volume" sort={sort} onSort={onSort} />
+                    <Th k="rsi" label="RSI" sort={sort} onSort={onSort} />
+                    <th className="py-3 px-3 text-center">60 Days</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60 font-mono text-xs">
+                  {rows.map(r => (
+                    <tr key={r.ticker} className="hover:bg-slate-800/40">
+                      <td className="py-2.5 px-3"><span className="font-bold text-white text-sm font-sans">{r.ticker}</span>{r.leader && <span className="ml-1.5 text-[10px] bg-emerald-500/20 text-emerald-300 px-1 rounded font-sans">Leader</span>}
+                        <div className="text-[10px] text-slate-500 font-sans truncate max-w-[150px]">{r.name}</div></td>
+                      <td className="py-2.5 px-3 text-slate-400" dir="ltr">{(r.sources || []).join(" ")}</td>
+                      <td className="py-2.5 px-3" dir="ltr">${r.price.toFixed(2)}</td>
+                      <td className={`py-2.5 px-3 ${pctCls(r.dayChg)}`} dir="ltr">{fmtPct(r.dayChg)}</td>
+                      <td className="py-2.5 px-3" dir="ltr">{r.distAth}%</td>
+                      <td className="py-2.5 px-3" dir="ltr">{r.dist52}%</td>
+                      <td className="py-2.5 px-3 text-center"><span className={`px-2 py-0.5 rounded font-bold ${rankCls(r.rsRank)}`}>{r.rsRank ?? "—"}</span></td>
+                      <td className={`py-2.5 px-3 ${pctCls(r.rel3m)}`} dir="ltr">{fmtPct(r.rel3m, 1)}</td>
+                      <td className="py-2.5 px-3"><TrendCell r={r} /></td>
+                      <td className={`py-2.5 px-3 ${r.volRatio >= 1.5 ? "text-yellow-300" : "text-slate-400"}`} dir="ltr">×{r.volRatio ?? "—"}</td>
+                      <td className={`py-2.5 px-3 ${r.rsi >= 70 ? "text-amber-300" : r.rsi <= 30 ? "text-sky-300" : ""}`} dir="ltr">{r.rsi}</td>
+                      <td className="py-2.5 px-3"><div className="flex justify-center"><Spark values={r.spark} /></div></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {rows.length === 0 && <div className="p-10 text-center text-slate-500 text-sm">No stocks match the criteria right now — uncheck "Leaders only"</div>}
+          </div>
+          <p className="text-[11px] text-slate-600 mt-2">Holdings are an approximate, static list of the largest positions in each ETF (may not be fully up to date).</p>
+        </div>
+      );
+    }
+
+    // ---------- app ----------
+    function App() {
+      const h = useMemo(readHash, []);
+      const [data, setData] = useState(null);
+      const [loading, setLoading] = useState(true);
+      const [error, setError] = useState(null);
+      const [extra, setExtra] = useState(h.extra || store.get("etf_extra", []));
+      const [favs, setFavs] = useState(store.get("etf_favs", []));
+      const [tab, setTab] = useState(h.tab || "table");
+      const [cat, setCat] = useState(h.cat || "ALL");
+      const [q, setQ] = useState(h.q || "");
+      const [sort, setSort] = useState({ key: h.sk || "distAth", dir: h.sd || "desc" });
+      const [expanded, setExpanded] = useState(null);
+      const [heatMetric, setHeatMetric] = useState("r3m");
+      const [newTicker, setNewTicker] = useState("");
+      const [notice, setNotice] = useState(null);
+      const [scan, setScan] = useState(null);
+      const [scanLoading, setScanLoading] = useState(false);
+      const [scanError, setScanError] = useState(null);
+      const extraKey = extra.join(",");
+
+      const load = useCallback(async (force = false) => {
+        setLoading(true);
+        try {
+          let res = await fetch(`/api/data?extra=${encodeURIComponent(extraKey)}${force ? "&force=1" : ""}`).catch(() => null);
+          if (!res || !res.ok) {
+            res = await fetch("data.json");
+          }
+          const json = await res.json();
+          if (!res.ok) throw new Error(json.error || res.statusText);
+          setData(json); setError(null);
+          if (json.errors && json.errors.length) {
+            setNotice(`No data found for: ${json.errors.join(", ")}`);
+            setExtra(prev => prev.filter(t => !json.errors.includes(t)));
+          }
+        } catch (e) { setError(e.message); } finally { setLoading(false); }
+      }, [extraKey]);
+
+      const loadScan = useCallback(async (force = false) => {
+        setScanLoading(true);
+        try {
+          let res = await fetch("/api/scanner" + (force ? "?force=1" : "")).catch(() => null);
+          if (!res || !res.ok) {
+            res = await fetch("scanner.json");
+          }
+          const json = await res.json();
+          if (!res.ok) throw new Error(json.error || res.statusText);
+          setScan(json); setScanError(null);
+        } catch (e) { setScanError(e.message); } finally { setScanLoading(false); }
+      }, []);
+
+      useEffect(() => { load(); const id = setInterval(() => load(), AUTO_REFRESH_MS); return () => clearInterval(id); }, [load]);
+      useEffect(() => { if (tab === "scanner" && !scan && !scanLoading) loadScan(); }, [tab]);
+      useEffect(() => store.set("etf_extra", extra), [extra]);
+      useEffect(() => store.set("etf_favs", favs), [favs]);
+      useEffect(() => { history.replaceState(null, "", "#" + encodeURIComponent(JSON.stringify({ tab, cat, q, sk: sort.key, sd: sort.dir, extra }))); }, [tab, cat, q, sort, extra]);
+
+      const processed = useMemo(() => data ? data.etfs.map(withTrend) : [], [data]);
+      const filtered = useMemo(() => sortRows(processed.filter(r =>
+        (cat === "ALL" || (cat === "FAVS" ? favs.includes(r.ticker) : r.category === cat)) &&
+        (r.ticker.toLowerCase().includes(q.toLowerCase()) || r.name.toLowerCase().includes(q.toLowerCase()))
+      ), sort), [processed, cat, q, sort, favs]);
+
+      const onSort = k => setSort(s => s.key === k ? { key: k, dir: s.dir === "asc" ? "desc" : "asc" } : { key: k, dir: k === "ticker" ? "asc" : "desc" });
+      const toggleFav = t => setFavs(f => f.includes(t) ? f.filter(x => x !== t) : [...f, t]);
+      const addTicker = e => {
+        e.preventDefault();
+        const t = newTicker.trim().toUpperCase();
+        if (!/^[A-Z0-9.\-^]{1,10}$/.test(t)) return;
+        if (!processed.some(r => r.ticker === t)) setExtra(x => [...x, t]);
+        setFavs(f => f.includes(t) ? f : [...f, t]);
+        setNewTicker("");
+      };
+      const share = async () => {
+        try { await navigator.clipboard.writeText(location.href); setNotice("Link copied to clipboard ✓"); } catch { setNotice("Could not copy — copy the URL from the browser manually"); }
+      };
+      const refreshAll = () => { load(true); if (scan) loadScan(true); };
+
+      if (!data) {
+        return (
+          <div className="min-h-screen flex flex-col items-center justify-center gap-3 text-slate-400">
+            {error ? (<><div className="text-rose-400">Failed to load data: {error}</div>
+              <button onClick={() => load(true)} className="px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm">Try again</button></>)
+              : (<><div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div><div>Loading market data from Yahoo Finance...</div></>)}
+          </div>
+        );
+      }
+
+      const best = processed.reduce((p, c) => c.distAth > p.distAth ? c : p);
+      const worst = processed.reduce((p, c) => c.distAth < p.distAth ? c : p);
+      const count = s => processed.filter(r => r.quadrant === s).length;
+      const topRs = processed.reduce((p, c) => (c.rsRank || 0) > (p.rsRank || 0) ? c : p);
+      // Reversal candidate: still in a downtrend (below SMA200 or SMA50<SMA200, RS below benchmark)
+      // but showing the most early turn-up signals.
+      const reversalSignals = r => [
+        ["RS momentum rising", r.rsMom != null && r.rsMom > 100],
+        ["Above SMA20", r.sma20 != null && r.price > r.sma20],
+        ["Above SMA50", r.sma50 != null && r.price > r.sma50],
+        ["1M RS positive", r.rel1m != null && r.rel1m > 0],
+        ["1M return positive", r.r1m != null && r.r1m > 0],
+        ["Volume ≥ 1.2× avg", r.volRatio != null && r.volRatio >= 1.2],
+      ];
+      const reversal = processed
+        .filter(r => (r.quadrant === "Lagging" || r.quadrant === "Improving") && ((r.sma200 != null && r.price < r.sma200) || r.trend5075 === false))
+        .map(r => ({ r, sig: reversalSignals(r) }))
+        .map(o => ({ ...o, score: o.sig.filter(s => s[1]).length }))
+        .sort((a, b) => b.score - a.score || (b.r.rsMom || 0) - (a.r.rsMom || 0))[0];
+      const bm = data.benchmarkRet;
+      const cats = ["ALL", "FAVS", ...data.categories];
+      const tabs = [["table", "📋 Table"], ["heatmap", "🟩 Heatmap"], ["rrg", "🧭 RRG"], ["scanner", "🔍 Stock Scanner"]];
+
+      return (
+        <div className="max-w-7xl mx-auto px-4 py-8">
+          <header className="mb-6 border-b border-slate-800 pb-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse"></span>
+                <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight text-white">Industry & Theme Tracking Dashboard</h1>
+              </div>
+              <p className="text-slate-400 text-sm mt-1">Distance from ATH, relative strength (RS vs SPY), sector rotation (RRG) and stock scanner</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-lg text-xs text-slate-400">
+              <button onClick={refreshAll} disabled={loading} className="px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white font-semibold transition-all flex items-center gap-1.5">
+                <span className={loading ? "inline-block animate-spin" : "inline-block"}>⟳</span>{loading ? "Refreshing..." : "Refresh"}
+              </button>
+              {error && <span className="text-rose-400">Refresh error</span>}
+              <span className="text-slate-600">|</span>
+              <span dir="ltr" title="SPY return">SPY: 1m {fmtPct(bm["1m"], 1)} · 3m {fmtPct(bm["3m"], 1)} · 12m {fmtPct(bm["12m"], 1)}</span>
+              <span className="text-slate-600">|</span>
+              <span>Close: <strong dir="ltr">{data.lastTradingDay}</strong></span>
+            </div>
+          </header>
+
+          {notice && <div className="mb-4 px-4 py-2 rounded-lg bg-slate-800 text-slate-200 text-sm flex justify-between"><span>{notice}</span><button onClick={() => setNotice(null)} className="text-slate-400">✕</button></div>}
+
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
+            <div className="bg-gradient-to-br from-sky-950/60 to-slate-900 border border-sky-800/60 rounded-xl p-4"
+              title={reversal ? reversal.sig.map(s => (s[1] ? "✔ " : "✘ ") + s[0]).join("\n") : ""}>
+              <span className="text-xs text-sky-300">↺ Reversal candidate</span>
+              {reversal ? <>
+                <div className="text-xl font-bold text-sky-300 mt-1">{reversal.r.ticker}</div>
+                <span className="text-xs text-slate-400">{reversal.score}/6 turn-up signals</span>
+                <div className="text-[10px] text-slate-500 truncate">{reversal.r.name}</div>
+              </> : <div className="text-sm text-slate-500 mt-2">No downtrend sector is turning up</div>}
+            </div>
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4"><span className="text-xs text-slate-400">Closest to high</span>
+              <div className="text-xl font-bold text-emerald-400 mt-1">{best.ticker}</div><span className="text-xs text-slate-500" dir="ltr">{best.distAth}%</span></div>
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4"><span className="text-xs text-slate-400">Farthest from high</span>
+              <div className="text-xl font-bold text-rose-400 mt-1">{worst.ticker}</div><span className="text-xs text-slate-500" dir="ltr">{worst.distAth}%</span></div>
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4"><span className="text-xs text-slate-400">Strongest RS</span>
+              <div className="text-xl font-bold text-indigo-300 mt-1">{topRs.ticker}</div><span className="text-xs text-slate-500">Rank {topRs.rsRank}</span></div>
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4"><span className="text-xs text-slate-400">Leading / Improving</span>
+              <div className="text-xl font-bold text-white mt-1">{count("Leading")} / {count("Improving")}</div><span className="text-xs text-emerald-500">of {processed.length}</span></div>
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4"><span className="text-xs text-slate-400">Weakening / Lagging</span>
+              <div className="text-xl font-bold text-rose-300 mt-1">{count("Weakening")} / {count("Lagging")}</div><span className="text-xs text-rose-400">Negative momentum</span></div>
+          </div>
+
+          <div className="flex gap-1 mb-4 border-b border-slate-800">
+            {tabs.map(([k, l]) => (
+              <button key={k} onClick={() => setTab(k)} className={`px-4 py-2 text-sm rounded-t-lg transition-all ${tab === k ? "bg-slate-900 text-white font-semibold border border-b-0 border-slate-800" : "text-slate-400 hover:text-white"}`}>{l}</button>
+            ))}
+          </div>
+
+          {tab !== "scanner" && (
+            <div className="flex flex-col lg:flex-row gap-4 justify-between items-center bg-slate-900/60 border border-slate-800 p-4 rounded-xl mb-6">
+              <div className="flex flex-wrap gap-1.5 w-full lg:w-auto">
+                {cats.map(c => (
+                  <button key={c} onClick={() => setCat(c)} className={`px-3 py-1.5 text-xs rounded-lg transition-all ${cat === c ? "bg-indigo-600 text-white font-semibold shadow-md shadow-indigo-500/20" : "bg-slate-800/80 text-slate-400 hover:text-white hover:bg-slate-800"}`}>
+                    {CAT_LABEL[c] || c}{c === "FAVS" ? ` (${favs.length})` : ""}
+                  </button>
+                ))}
+              </div>
+              <div className="flex flex-wrap items-center gap-2 w-full lg:w-auto">
+                <input type="text" placeholder="Search ticker or name..." value={q} onChange={e => setQ(e.target.value)}
+                  className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded-lg text-sm text-slate-200 focus:outline-none focus:border-indigo-500 w-full md:w-40" />
+                <form onSubmit={addTicker} className="flex gap-1">
+                  <input type="text" placeholder="Add ticker (QQQ)" value={newTicker} onChange={e => setNewTicker(e.target.value)} dir="ltr"
+                    className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded-lg text-sm text-slate-200 focus:outline-none focus:border-indigo-500 w-36" />
+                  <button className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold">＋</button>
+                </form>
+                <button onClick={() => downloadCsv("etf_dashboard.csv", ETF_CSV, filtered)} className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm">⬇ CSV</button>
+                <button onClick={share} className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm">🔗 Share</button>
+              </div>
+            </div>
+          )}
+
+          {tab === "table" && <TableView rows={filtered} sort={sort} onSort={onSort} expanded={expanded} setExpanded={setExpanded}
+            favs={favs} toggleFav={toggleFav} extra={extra} removeExtra={t => { setExtra(x => x.filter(y => y !== t)); setFavs(f => f.filter(y => y !== t)); }} />}
+          {tab === "heatmap" && <Heatmap rows={filtered} metric={heatMetric} setMetric={setHeatMetric} />}
+          {tab === "rrg" && <RRG rows={filtered} />}
+          {tab === "scanner" && <Scanner scan={scan} loading={scanLoading} error={scanError} onReload={() => loadScan(true)} favs={favs} />}
+
+          <footer className="mt-8 text-center text-xs text-slate-600 leading-relaxed">
+            Real data from Yahoo Finance • ATH = daily high over full history (plus adjusted ATH and 52-week high) • RS Rank = percentile of weighted RS (1m/3m/6m/12m) vs SPY •
+            RRG = RS-Ratio and RS-Momentum vs SPY • Updated: <span dir="ltr">{data.updated}</span> • Auto-refreshes every 5 minutes
+            <br />For educational and technical-analysis purposes only; not investment advice.
+          </footer>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
